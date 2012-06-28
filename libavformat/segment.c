@@ -36,6 +36,8 @@ typedef struct {
     AVFormatContext *avf;
     char *format;          /**< Set by a private option. */
     char *list;            /**< Set by a private option. */
+    char *valid_frames;    /**< Set by a private option. */
+    const char *valid_frame_delimiter;
     float time;            /**< Set by a private option. */
     int  size;             /**< Set by a private option. */
     int  wrap;             /**< Set by a private option. */
@@ -43,6 +45,10 @@ typedef struct {
     int64_t recording_time;
     int has_video;
     AVIOContext *pb;
+    int64_t next_valid_frame;
+    char *next_valid_frame_ptr;
+    int64_t frame_count;
+    int observe_valid_frames;
 } SegmentContext;
 
 static int segment_start(AVFormatContext *s)
@@ -107,10 +113,26 @@ static int seg_write_header(AVFormatContext *s)
     SegmentContext *seg = s->priv_data;
     AVFormatContext *oc;
     int ret, i;
+    char* token;
 
     seg->number = 0;
     seg->offset_time = 0;
     seg->recording_time = seg->time * 1000000;
+    seg->frame_count = 0;
+    seg->valid_frame_delimiter = ",";
+    seg->next_valid_frame_ptr = NULL;
+
+    if (seg->valid_frames) {
+        token = av_strtok(seg->valid_frames, seg->valid_frame_delimiter, &seg->next_valid_frame_ptr);
+        if (token) {
+            seg->next_valid_frame = strtol(token, NULL, 10);
+        }
+        seg->observe_valid_frames = 1;
+    } else {
+        seg->next_valid_frame = 0;
+        seg->observe_valid_frames = 0;
+    }
+
 
     oc = avformat_alloc_context();
 
@@ -189,14 +211,29 @@ static int seg_write_packet(AVFormatContext *s, AVPacket *pkt)
     AVStream *st = oc->streams[pkt->stream_index];
     int64_t end_pts = seg->recording_time * seg->number;
     int ret;
+    char* token;
+    int can_split;
 
-    if ((seg->has_video && st->codec->codec_type == AVMEDIA_TYPE_VIDEO) &&
-        av_compare_ts(pkt->pts, st->time_base,
-                      end_pts, AV_TIME_BASE_Q) >= 0 &&
-        pkt->flags & AV_PKT_FLAG_KEY) {
+    can_split = seg->has_video && st->codec->codec_type == AVMEDIA_TYPE_VIDEO && (pkt->flags & AV_PKT_FLAG_KEY);
 
-        av_log(s, AV_LOG_DEBUG, "Next segment starts at %d %"PRId64"\n",
-               pkt->stream_index, pkt->pts);
+    if (seg->observe_valid_frames) {
+        if (seg->next_valid_frame < seg->frame_count) {
+            token = av_strtok(NULL, seg->valid_frame_delimiter, &seg->next_valid_frame_ptr);
+            if (token) {
+                seg->next_valid_frame = strtol(token, NULL, 10);
+            }
+        }
+        if (seg->next_valid_frame != seg->frame_count) {
+            can_split = 0;
+        }
+    }
+
+    if (can_split && av_compare_ts(pkt->pts, st->time_base, end_pts, AV_TIME_BASE_Q) >= 0) {
+
+        av_log(s, AV_LOG_DEBUG, "Next segment starts at %d %"PRId64" with frame count of %"PRId64" \n",
+               pkt->stream_index, pkt->pts, seg->frame_count);
+
+        seg->next_valid_frame = -1;
 
         ret = segment_end(oc);
 
@@ -216,6 +253,10 @@ static int seg_write_packet(AVFormatContext *s, AVPacket *pkt)
                     goto fail;
             }
         }
+    }
+
+    if (st->codec->codec_type == AVMEDIA_TYPE_VIDEO) {
+        seg->frame_count++;
     }
 
     ret = oc->oformat->write_packet(oc, pkt);
@@ -248,11 +289,12 @@ static int seg_write_trailer(struct AVFormatContext *s)
 #define OFFSET(x) offsetof(SegmentContext, x)
 #define E AV_OPT_FLAG_ENCODING_PARAM
 static const AVOption options[] = {
-    { "segment_format",    "container format used for the segments",  OFFSET(format),  AV_OPT_TYPE_STRING, {.str = NULL},  0, 0,       E },
-    { "segment_time",      "segment length in seconds",               OFFSET(time),    AV_OPT_TYPE_FLOAT,  {.dbl = 2},     0, FLT_MAX, E },
-    { "segment_list",      "output the segment list",                 OFFSET(list),    AV_OPT_TYPE_STRING, {.str = NULL},  0, 0,       E },
-    { "segment_list_size", "maximum number of playlist entries",      OFFSET(size),    AV_OPT_TYPE_INT,    {.dbl = 5},     0, INT_MAX, E },
-    { "segment_wrap",      "number after which the index wraps",      OFFSET(wrap),    AV_OPT_TYPE_INT,    {.dbl = 0},     0, INT_MAX, E },
+    { "segment_format",          "container format used for the segments",                              OFFSET(format),          AV_OPT_TYPE_STRING, {.str = NULL},  0, 0,       E },
+    { "segment_time",            "segment length in seconds",                                           OFFSET(time),           AV_OPT_TYPE_FLOAT,   {.dbl = 2},     0, FLT_MAX, E },
+    { "segment_valid_frames",    "comma separated list of frame numbers allowed to start segments",     OFFSET(valid_frames),   AV_OPT_TYPE_STRING,  {.str = NULL},  0, 0,       E },
+    { "segment_list",            "output the segment list",                                             OFFSET(list),           AV_OPT_TYPE_STRING,  {.str = NULL},  0, 0,       E },
+    { "segment_list_size",       "maximum number of playlist entries",                                  OFFSET(size),           AV_OPT_TYPE_INT,     {.dbl = 5},     0, INT_MAX, E },
+    { "segment_wrap",            "number after which the index wraps",                                  OFFSET(wrap),           AV_OPT_TYPE_INT,     {.dbl = 0},     0, INT_MAX, E },
     { NULL },
 };
 
